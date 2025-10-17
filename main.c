@@ -9,40 +9,36 @@
 #define STDERR(...) (fprintf(stderr, __VA_ARGS__))
 
 typedef  struct {
-    int in;
-    int out;
-    sem_t *sem;
+    FILE *in;
+    FILE *out;
     FILE* log;
+    sem_t *sem;
 } copy_args;
 
 void *copy_data(void *a) {
   copy_args *args = (copy_args *)a;
   int bufsize = 128;
   char *buf = malloc(bufsize);
-  printf("[%d] starting\n", args->in);
   for(;;) {
-    ssize_t n = read(args->in, buf, bufsize);
-    if (n <= 0) {
-      STDERR("[%d] got %ld: %s\n", args->in, n, strerror(errno));
+    if (fgets(buf, bufsize, args->in) == NULL) {
+      STDERR("fail: %s\n", strerror(errno));
       break;
     }
-    STDERR("read %ld bytes from %d\n", n, args->in);
-    if (write(args->out, buf, n) <= 0) {
+    if (fputs(buf, args->out) < 0) {
       break;
     }
-    fwrite(buf, 1, n, args->log);
+    fputs(buf, args->log);
   }
 
-  printf("done %d\n", args->in);
   sem_post(args->sem);
   return NULL;
 }
 
 void runCmd(int pipes[3][2], char *cmd, char *argv[]) {
-  if (pipe(pipes[0]) < 0) { // stdout
+  if (pipe(pipes[0]) < 0) { // stdin
     STDERR("creating pipe: %s\n", strerror(errno));
   }
-  if (pipe(pipes[1]) < 0) { // stdin
+  if (pipe(pipes[1]) < 0) { // stdout
     STDERR("creating pipe: %s\n", strerror(errno));
   }
   if (pipe(pipes[2]) < 0) { // stderr
@@ -58,9 +54,9 @@ void runCmd(int pipes[3][2], char *cmd, char *argv[]) {
       close(pipes[1][0]);       // close read end of stdout
       close(pipes[2][0]);       // close read end of stderr
 
-      if (execvp(cmd, argv) != 0) {
-        STDERR("failed to start command: %s\n", strerror(errno));
-      }
+      execvp(cmd, argv);
+      STDERR("failed to start command: %s\n", strerror(errno));
+      exit(-1);
   }
 
   close(pipes[0][0]);
@@ -132,16 +128,16 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  copy_args stdout_args = {.in = pipes[1][0], .out = STDOUT_FILENO, .log = stdout_log, .sem = sem};
-  copy_args stdin_args = {.in = STDIN_FILENO, .out = pipes[0][1], .log = stdin_log, .sem = sem};
-  copy_args stderr_args = {.in = pipes[2][0], .out = STDERR_FILENO, .log = stderr_log, .sem = sem};
+  copy_args stdout_args = {.in = fdopen(pipes[1][0], "r"), .out = stdout, .log = stdout_log, .sem = sem};
+  copy_args stdin_args = {.in = stdin, .out = fdopen(pipes[0][1], "w"), .log = stdin_log, .sem = sem};
+  copy_args stderr_args = {.in = fdopen(pipes[2][0], "r"), .out = stderr, .log = stderr_log, .sem = sem};
   pthread_create(&stdout_logger, NULL, copy_data, &stdout_args);
   pthread_create(&stdin_logger, NULL, copy_data, &stdin_args);
   pthread_create(&stderr_logger, NULL, copy_data, &stderr_args);
 
   sem_wait(sem);
   // close(pipes[1][0]);
-  close(STDIN_FILENO);
+  fclose(stdin);
   // close(pipes[2][0]);
   pthread_join(stdout_logger, NULL);
   pthread_join(stdin_logger, NULL);
