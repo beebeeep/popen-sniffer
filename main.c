@@ -4,37 +4,43 @@
 #include <sys/errno.h>
 #include <string.h>
 #include <pthread.h>
-#include <semaphore.h>
 
 #define STDERR(...) (fprintf(stderr, __VA_ARGS__))
 
 typedef  struct {
     FILE *in;
     FILE *out;
-    FILE* log;
-    sem_t *sem;
+    char *logfile;
 } copy_args;
 
 void *copy_data(void *a) {
   copy_args *args = (copy_args *)a;
   int bufsize = 128;
   char *buf = malloc(bufsize);
-  for(;;) {
-    if (fgets(buf, bufsize, args->in) == NULL) {
-      STDERR("fail: %s\n", strerror(errno));
-      break;
-    }
-    if (fputs(buf, args->out) < 0) {
-      break;
-    }
-    fputs(buf, args->log);
+  FILE *log = fopen(args->logfile, "a");
+  if (log == NULL) {
+    STDERR("opening %s: %s\n", args->logfile, strerror(errno));
+    exit(-1);
   }
 
-  sem_post(args->sem);
+  for(;;) {
+    if (fgets(buf, bufsize, args->in) == NULL) {
+      fclose(args->out);
+      break;
+    }
+    if (fputs(buf, args->out) <= 0) {
+      fclose(args->in);
+      break;
+    }
+    fputs(buf, log);
+  }
+
+  free(buf);
+  fclose(log);
   return NULL;
 }
 
-void runCmd(int pipes[3][2], char *cmd, char *argv[]) {
+pid_t runCmd(int pipes[3][2], char *cmd, char *argv[]) {
   if (pipe(pipes[0]) < 0) { // stdin
     STDERR("creating pipe: %s\n", strerror(errno));
   }
@@ -45,7 +51,8 @@ void runCmd(int pipes[3][2], char *cmd, char *argv[]) {
     STDERR("creating pipe: %s\n", strerror(errno));
   }
 
-  if (fork() == 0 ) {
+  pid_t pid = fork();
+  if (pid == 0) {
       dup2(pipes[0][0], STDIN_FILENO);  // attach input pipe to stdin 
       dup2(pipes[1][1], STDOUT_FILENO); // attach output pipe to stdout
       dup2(pipes[2][1], STDERR_FILENO); // attach output pipe to stderr
@@ -62,6 +69,7 @@ void runCmd(int pipes[3][2], char *cmd, char *argv[]) {
   close(pipes[0][0]);
   close(pipes[1][1]);
   close(pipes[2][1]);
+  return pid;
 }
 
 int main(int argc, char *argv[]) {
@@ -101,63 +109,33 @@ int main(int argc, char *argv[]) {
   }
   cmd_args[argc-optind+1] = NULL;
 
-  FILE *stdin_log = fopen(stdin_logfile, "a");
-  if (stdin_log == NULL) {
-    STDERR("Failed to open stdin log file: %s\n", strerror(errno));
-    return -1;
-  }
-  FILE *stdout_log = fopen(stdout_logfile, "a");
-  if (stdin_log == NULL) {
-    STDERR("Failed to open stdout log file: %s\n", strerror(errno));
-    return -1;
-  }
-
-  FILE *stderr_log = fopen(stderr_logfile, "a");
-  if (stdin_log == NULL) {
-    STDERR("Failed to open stdout log file: %s\n", strerror(errno));
-    return -1;
-  }
-
   int pipes[3][2];
-  runCmd(pipes, cmd_args[0], cmd_args);
+  pid_t child_pid = runCmd(pipes, cmd_args[0], cmd_args);
 
   pthread_t stdout_logger, stdin_logger, stderr_logger; 
-  sem_t *sem = sem_open("psn_semaphore", O_CREAT, 0600, 0);
-  if (sem == SEM_FAILED) {
-    STDERR("creating semaphore: %s\n", strerror(errno));
-    return -1;
-  }
+  copy_args stdout_args = {.in = fdopen(pipes[1][0], "r"), .out = stdout, .logfile = stdout_logfile};
+  copy_args stdin_args = {.in = stdin, .out = fdopen(pipes[0][1], "w"), .logfile = stdin_logfile};
+  copy_args stderr_args = {.in = fdopen(pipes[2][0], "r"), .out = stderr, .logfile = stderr_logfile};
 
-  copy_args stdout_args = {.in = fdopen(pipes[1][0], "r"), .out = stdout, .log = stdout_log, .sem = sem};
-  copy_args stdin_args = {.in = stdin, .out = fdopen(pipes[0][1], "w"), .log = stdin_log, .sem = sem};
-  copy_args stderr_args = {.in = fdopen(pipes[2][0], "r"), .out = stderr, .log = stderr_log, .sem = sem};
+
   pthread_create(&stdout_logger, NULL, copy_data, &stdout_args);
   pthread_create(&stdin_logger, NULL, copy_data, &stdin_args);
   pthread_create(&stderr_logger, NULL, copy_data, &stderr_args);
 
-  sem_wait(sem);
-  // close(pipes[1][0]);
-  fclose(stdin);
-  // close(pipes[2][0]);
+  waitpid(child_pid, NULL, 0);
+  fclose(stdin_args.in);
+  fclose(stdout_args.in);
+  fclose(stderr_args.in);
+
   pthread_join(stdout_logger, NULL);
   pthread_join(stdin_logger, NULL);
   pthread_join(stderr_logger, NULL);
-  /*
-  int bufsize = 1024;
-  char *buf = malloc(bufsize);
-  for(;;) {
-    int n = read(pipes[1][0], buf, bufsize);
-    if (n == 0) {
-      break;
-    }
-    if (n == -1) {
-      STDERR("failed to read: %s\n", strerror(errno));
-      return -1;
-    }
-    write(STDOUT_FILENO, buf, n);
-  }
-  */
-  
+
+  free(stdin_logfile);
+  free(stdout_logfile);
+  free(stderr_logfile);
+  free(cmd_args);
+
   return 0;
 }
 
